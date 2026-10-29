@@ -3,6 +3,7 @@ import pandas as pd
 import plotly.express as px
 from sqlalchemy import create_engine
 import os
+import datetime
 from dotenv import load_dotenv
 
 # Load environment variables
@@ -68,14 +69,44 @@ if df.empty:
     st.warning(f"No observation data available for {selected_station_name}.")
     st.stop()
 
-# --- Rule Engine Logic for UI ---
+# --- Soil-Aware Rule Engine Logic for UI (Volumetric Water Content %) ---
 latest_soil_moisture = df['soil_moisture_pct'].iloc[-1]
 recent_rain_48h = df['precipitation_mm'].tail(48).sum()
 recent_soil_temp = df['soil_temp_c'].tail(48).mean()
 recent_rain_24h = df['precipitation_mm'].tail(24).sum()
 
-turnout_safe = latest_soil_moisture <= 75.0 and recent_rain_48h <= 15.0
-sowing_safe = recent_soil_temp >= 6.0 and recent_rain_24h <= 5.0
+# Dynamic thresholds based on station soil type and VWC limits
+if "Heavy Clay" in selected_station_name:
+    # Heavy clay holds water tightly and poaches easily above ~32% VWC
+    moisture_limit = 32.0
+    rain_limit_48h = 10.0
+    soil_temp_limit = 7.0
+elif "Free-Draining" in selected_station_name:
+    # Free-draining sandy loam can handle higher moisture (~40% VWC) before structural risk
+    moisture_limit = 40.0
+    rain_limit_48h = 20.0
+    soil_temp_limit = 5.5
+else:
+    # Standard Loam baseline
+    moisture_limit = 35.0
+    rain_limit_48h = 15.0
+    soil_temp_limit = 6.0
+
+turnout_safe = latest_soil_moisture <= moisture_limit and recent_rain_48h <= rain_limit_48h
+sowing_safe = recent_soil_temp >= soil_temp_limit and recent_rain_24h <= 5.0
+
+# Get current month to enforce seasonal agronomic calendars
+current_month = datetime.datetime.now().month
+
+# Sowing is only physically viable during specific windows (Spring: Mar-Apr, Autumn: Sep-Oct)
+is_valid_sowing_season = current_month in [3, 4, 9]
+
+# Update sowing safety check
+sowing_safe = (
+    is_valid_sowing_season and 
+    recent_soil_temp >= soil_temp_limit and 
+    recent_rain_24h <= 5.0
+)
 
 # --- Status Display ---
 st.subheader("Operational Decision Status")
@@ -93,7 +124,16 @@ with col2:
     else:
         st.error("**Sowing Readiness:** RED - Conditions Unfavorable")
 
-st.markdown("---")
+# --- Transparency & Metric Inspection ---
+with st.expander("🔍 View Decision Rule Metrics & Thresholds"):
+    m_col1, m_col2 = st.columns(2)
+    with m_col1:
+        st.markdown(f"**Station:** {selected_station_name}")
+        st.markdown(f"**Current Soil Moisture:** {latest_soil_moisture:.1f}% (Limit: $\le$ {moisture_limit}%)")
+        st.markdown(f"**48h Cumulative Rain:** {recent_rain_48h:.1f} mm (Limit: $\le$ {rain_limit_48h} mm)")
+    with m_col2:
+        st.markdown(f"**48h Avg Soil Temp:** {recent_soil_temp:.1f}°C (Limit: $\ge$ {soil_temp_limit}°C)")
+        st.markdown(f"**24h Cumulative Rain:** {recent_rain_24h:.1f} mm (Limit: $\le$ 5.0 mm)")
 
 # --- Interactive Time-Series Charts ---
 st.subheader("Telemetry & Soil Conditions (Last 7 Days)")
