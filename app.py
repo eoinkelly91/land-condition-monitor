@@ -52,11 +52,11 @@ selected_station_id = stations_df.loc[
     stations_df['station_name'] == selected_station_name, 'station_id'
 ].values[0]
 
-# --- Fetch Station Observations ---
+# --- Fetch Station Observations & Forecasts ---
 @st.cache_data(ttl=600)
 def load_data(station_id):
     query = f"""
-        SELECT timestamp, air_temp_c, soil_temp_c, soil_moisture_pct, precipitation_mm, wind_speed_ms, solar_radiation_wm2
+        SELECT timestamp, air_temp_c, soil_temp_c, soil_moisture_pct, precipitation_mm, wind_speed_ms, solar_radiation_wm2, is_forecast
         FROM weather_observations
         WHERE station_id = '{station_id}'
         ORDER BY timestamp ASC;
@@ -69,44 +69,49 @@ if df.empty:
     st.warning(f"No observation data available for {selected_station_name}.")
     st.stop()
 
+# Split into historical observations and future forecasts
+df_history = df[df['is_forecast'] == False]
+df_forecast = df[df['is_forecast'] == True]
+
 # --- Soil-Aware Rule Engine Logic for UI (Volumetric Water Content %) ---
-latest_soil_moisture = df['soil_moisture_pct'].iloc[-1]
-recent_rain_48h = df['precipitation_mm'].tail(48).sum()
-recent_soil_temp = df['soil_temp_c'].tail(48).mean()
-recent_rain_24h = df['precipitation_mm'].tail(24).sum()
+# Use latest available historical reading for current status
+latest_df = df_history if not df_history.empty else df
+latest_soil_moisture = latest_df['soil_moisture_pct'].iloc[-1] if not latest_df.empty else 0.0
+recent_rain_48h = latest_df['precipitation_mm'].tail(48).sum() if not latest_df.empty else 0.0
+recent_soil_temp = latest_df['soil_temp_c'].tail(48).mean() if not latest_df.empty else 0.0
+recent_rain_24h = latest_df['precipitation_mm'].tail(24).sum() if not latest_df.empty else 0.0
 
 # Dynamic thresholds based on station soil type and VWC limits
 if "Heavy Clay" in selected_station_name:
-    # Heavy clay holds water tightly and poaches easily above ~32% VWC
     moisture_limit = 32.0
     rain_limit_48h = 10.0
     soil_temp_limit = 7.0
 elif "Free-Draining" in selected_station_name:
-    # Free-draining sandy loam can handle higher moisture (~40% VWC) before structural risk
     moisture_limit = 40.0
     rain_limit_48h = 20.0
     soil_temp_limit = 5.5
 else:
-    # Standard Loam baseline
     moisture_limit = 35.0
     rain_limit_48h = 15.0
     soil_temp_limit = 6.0
 
 turnout_safe = latest_soil_moisture <= moisture_limit and recent_rain_48h <= rain_limit_48h
-sowing_safe = recent_soil_temp >= soil_temp_limit and recent_rain_24h <= 5.0
 
-# Get current month to enforce seasonal agronomic calendars
+# Sowing seasonal calendar gate (Spring: Mar-Apr, Autumn: Sep)
 current_month = datetime.datetime.now().month
-
-# Sowing is only physically viable during specific windows (Spring: Mar-Apr, Autumn: Sep-Oct)
 is_valid_sowing_season = current_month in [3, 4, 9]
-
-# Update sowing safety check
 sowing_safe = (
     is_valid_sowing_season and 
     recent_soil_temp >= soil_temp_limit and 
     recent_rain_24h <= 5.0
 )
+
+# --- 48-Hour Forecast Outlook Check ---
+forecast_48h = df_forecast.head(48) if not df_forecast.empty else pd.DataFrame()
+rain_forecast_48h = forecast_48h['precipitation_mm'].sum() if not forecast_48h.empty else 0.0
+soil_moisture_forecast_peak = forecast_48h['soil_moisture_pct'].max() if not forecast_48h.empty else latest_soil_moisture
+
+forecast_risk_elevated = soil_moisture_forecast_peak > moisture_limit or rain_forecast_48h > rain_limit_48h
 
 # --- Status Display ---
 st.subheader("Operational Decision Status")
@@ -122,24 +127,31 @@ with col2:
     if sowing_safe:
         st.success("**Sowing Readiness:** GREEN - Sowing Window Open")
     else:
-        st.error("**Sowing Readiness:** RED - Conditions Unfavorable")
+        st.error("**Sowing Readiness:** RED - Conditions Unfavorable (Seasonal / Soil)")
+
+# --- Forecast Outlook Banner ---
+st.subheader("🔮 48-Hour Proactive Risk Outlook")
+if forecast_risk_elevated:
+    st.warning(f"**Weather Warning:** Predicted rain ({rain_forecast_48h:.1f}mm) or rising soil moisture (Peak: {soil_moisture_forecast_peak:.1f}%) expected over the next 48 hours. Monitor paddock conditions closely.")
+else:
+    st.info(f"**Stable Outlook:** Next 48 hours look stable. Expected rainfall: {rain_forecast_48h:.1f}mm. No immediate weather-driven restrictions triggered.")
 
 # --- Transparency & Metric Inspection ---
 with st.expander("🔍 View Decision Rule Metrics & Thresholds"):
     m_col1, m_col2 = st.columns(2)
     with m_col1:
         st.markdown(f"**Station:** {selected_station_name}")
-        st.markdown(f"**Current Soil Moisture:** {latest_soil_moisture:.1f}% (Limit: $\le$ {moisture_limit}%)")
-        st.markdown(f"**48h Cumulative Rain:** {recent_rain_48h:.1f} mm (Limit: $\le$ {rain_limit_48h} mm)")
+        st.markdown(r"**Current Soil Moisture:** " + f"{latest_soil_moisture:.1f}% (Limit: $\le$ {moisture_limit}%)")
+        st.markdown(r"**48h Historical Rain:** " + f"{recent_rain_48h:.1f} mm (Limit: $\le$ {rain_limit_48h} mm)")
     with m_col2:
-        st.markdown(f"**48h Avg Soil Temp:** {recent_soil_temp:.1f}°C (Limit: $\ge$ {soil_temp_limit}°C)")
-        st.markdown(f"**24h Cumulative Rain:** {recent_rain_24h:.1f} mm (Limit: $\le$ 5.0 mm)")
+        st.markdown(r"**48h Avg Soil Temp:** " + f"{recent_soil_temp:.1f}°C (Limit: $\ge$ {soil_temp_limit}°C)")
+        st.markdown(f"**48h Forecast Rain Outlook:** {rain_forecast_48h:.1f} mm")
 
 # --- Interactive Time-Series Charts ---
-st.subheader("Telemetry & Soil Conditions (Last 7 Days)")
+st.subheader("Telemetry & 7-Day Forecast Trends")
 
 # Soil Moisture Chart
-fig_moisture = px.line(df, x='timestamp', y='soil_moisture_pct', title="Soil Moisture Content (%)")
+fig_moisture = px.line(df, x='timestamp', y='soil_moisture_pct', title="Soil Moisture Content (%) — History & Forecast")
 fig_moisture.update_layout(
     yaxis=dict(range=[0, 100]),
     yaxis_title="Soil Moisture Percentage",
@@ -150,7 +162,6 @@ st.plotly_chart(fig_moisture, use_container_width=True)
 col3, col4 = st.columns(2)
 
 with col3:
-    # Temperature Chart
     fig_temp = px.line(df, x='timestamp', y=['air_temp_c', 'soil_temp_c'], title="Air vs. Soil Temperature (°C)")
     fig_temp.update_layout(
         yaxis_title="Temperature (°C)",
@@ -159,7 +170,6 @@ with col3:
     st.plotly_chart(fig_temp, use_container_width=True)
 
 with col4:
-    # Precipitation Chart
     fig_rain = px.bar(df, x='timestamp', y='precipitation_mm', title="Precipitation / Rainfall (mm)")
     fig_rain.update_layout(
         yaxis_title="Precipitation (mm)",

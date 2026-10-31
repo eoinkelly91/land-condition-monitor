@@ -1,6 +1,6 @@
 # Land Condition Monitor
 
-An automated regional decision-support platform designed to ingest, process, and analyze meteorological and soil time-series data for agricultural planning.
+An automated regional decision-support platform designed to ingest, process, and analyse meteorological and soil time-series data for agricultural planning.
 
 ---
 
